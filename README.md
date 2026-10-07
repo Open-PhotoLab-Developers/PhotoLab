@@ -25,7 +25,7 @@ python tests.py --ui                # 追加 UI 冒烟测试（offscreen）
 - 退出蒙版编辑：`Esc`
 - 左键拖拽平移（缩放后）、滚轮以光标为中心缩放、双击适应窗口
 - 滑块滚轮微调、双击标签（或按右侧“重置”）复位
-- 环境依赖：Python3.10以上，推荐Python3.12 需要PySIde6 numpy opencv scipy.run.bat仅支持Windows
+- 环境依赖：Python3.10以上，推荐Python3.12 需要PySIde6(>=6.6) numpy opencv scipy(>=1.24)   run.bat仅支持Windows
 
 ## 2. 功能
 
