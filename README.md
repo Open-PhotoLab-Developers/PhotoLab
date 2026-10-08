@@ -14,7 +14,7 @@ run.bat                 :: 自动建虚拟环境 + 装依赖 + 启动
 或手动：
 
 ```bash
-pip install -r requirements.txt
+pip install PySide6 numpy opencv-python scipy
 python main.py                      # 也可把图片路径作为命令行参数
 python tests.py                     # 核心算法自检
 python tests.py --ui                # 追加 UI 冒烟测试（offscreen）
@@ -99,3 +99,7 @@ uint8 sRGB → 线性光
 - 保存走同一套全图流水线（后台渲染完成后落盘），支持 JPG/PNG/WebP/TIFF，路径支持中文。
 - 未实现：EXIF 方向自动旋转（OpenCV 直接解码）、RAW、局部渐变/径向之外的蒙版运算
   （尚不支持蒙版间相加/相减）、预设管理。
+## 5.其他
+
+-本项目仍处于初期阶段，问题较多。由小团队维护，稳定性无法保证。仅供体验和短期使用，不要投入生产工作。
+
