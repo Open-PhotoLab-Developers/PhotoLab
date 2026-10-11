@@ -43,7 +43,7 @@ python tests.py --ui                # 追加 UI 冒烟测试（offscreen）
 
 界面：左侧深灰底预览（缩放/平移/取色/蒙版编辑，蒙版以红色半透明叠加显示），右侧可折叠调整面板，顶部工具栏（打开/保存/重置/对比/缩放/取色模式）+ 状态栏。
 
-## 3. 架构（8 个源文件）
+## 3. 架构（7个源文件）
 
 ```
 photolab/
@@ -52,7 +52,6 @@ photolab/
 ├── ui_widgets.py    深色主题、滑块/分区/预览/曲线编辑器/色轮控件、后台处理线程
 ├── ui_window.py     基础/曲线/颜色分级/取色器/蒙版面板 + 主窗口
 ├── tests.py         核心算法自检 + UI 冒烟测试（python tests.py [--ui]）
-├── requirements.txt
 ├── README.md
 └── run.bat          一键启动
 ```
