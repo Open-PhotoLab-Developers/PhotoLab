@@ -22,6 +22,11 @@ from PySide6.QtWidgets import (QButtonGroup, QFileDialog, QFrame, QGridLayout,
                                QSizePolicy, QSplitter, QToolBar, QVBoxLayout,
                                QWidget)
 
+try:                                    # RAW 支持（可选依赖）
+    import rawpy
+except ImportError:                     # pragma: no cover
+    rawpy = None
+
 from core import (PREVIEW_MAX_EDGE, Adjustments, PickerState, downscale_max_edge,
                   hue_degrees, linear_histograms, mask_cache_key, render_mask,
                   sample_patch)
@@ -29,10 +34,13 @@ from ui_widgets import (CHANNEL_LABELS, CollapsibleSection, ColorWheel,
                         CurveEditor, FULL, PREVIEW, PreviewWidget,
                         ProcessorThread, SliderRow, mask_to_qimage)
 
-IMAGE_FILTER = "图像文件 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;所有文件 (*.*)"
-
 RANGE_LABELS = {"shadows": "阴影", "midtones": "中间调",
                 "highlights": "高光", "global": "全局"}
+
+# rawpy 可解码的常见 RAW 格式
+RAW_EXTENSIONS = (".dng", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf",
+                  ".sr2", ".raw", ".rw2", ".raf", ".orf", ".pef", ".ptx", ".x3f",
+                  ".r3d", ".fff", ".erf", ".kdc", ".dcr", ".mef", ".mos", ".mrw")
 
 
 # ======================================================================
@@ -815,6 +823,8 @@ class MaskPanel(QWidget):
                           geo=("radius", 100.0))
             self._add_row("长宽比", 20, 300, m.aspect * 100, 0, "%", 100.0, self._on_aspect,
                           geo=("aspect", 100.0))
+            self._add_row("旋转", 0, 360, m.angle, 0, "°", 0.0, self._on_angle,
+                          geo=("angle", 1.0))
         else:
             self._add_row("起点 X", 0, 100, m.x1 * 100, 0, "%", 30.0,
                           lambda v: self._on_linear(0, v), geo=("x1", 100.0))
@@ -876,6 +886,14 @@ class MaskPanel(QWidget):
         if m is None:
             return
         m.aspect = v / 100.0
+        self.overlayRefresh.emit()
+        self.changed.emit()
+
+    def _on_angle(self, v: float):
+        m = self._current_mask()
+        if m is None or m.kind != "radial":
+            return
+        m.angle = float(v)
         self.overlayRefresh.emit()
         self.changed.emit()
 
@@ -1016,6 +1034,8 @@ class MainWindow(QMainWindow):
         self.panel.mask.brushUndone.connect(self._on_brush_undo)
         self.preview.linearHandleMoved.connect(self._on_linear_handle)
         self.preview.radialCenterMoved.connect(self._on_radial_center)
+        self.preview.radialSizeMoved.connect(self._on_radial_size)
+        self.preview.radialAngleMoved.connect(self._on_radial_angle)
         self.preview.brushStrokePoint.connect(self._on_brush_point)
         self.preview.brushStrokeFinished.connect(self._on_brush_finished)
 
@@ -1097,6 +1117,14 @@ class MainWindow(QMainWindow):
         self.act_pick.triggered.connect(self._toggle_pick_mode)
         tb.addAction(self.act_pick)
 
+        tb.addSeparator()
+
+        self.act_bw = QAction("黑白", self)
+        self.act_bw.setCheckable(True)
+        self.act_bw.setToolTip("黑白模式：按亮度转为灰度（再点一次恢复彩色）")
+        self.act_bw.triggered.connect(self._toggle_blackwhite)
+        tb.addAction(self.act_bw)
+
     def _build_statusbar(self):
         sb = self.statusBar()
         self.status_image = QLabel("未打开图像")
@@ -1119,21 +1147,62 @@ class MainWindow(QMainWindow):
             self.panel.picker.delete_picker(idx)
 
     # ------------------------------------------------------------ 图像
+    def _image_filter(self) -> str:
+        parts = ["常见图像 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"]
+        if rawpy is not None:
+            parts.append("RAW (" + " ".join("*" + e for e in RAW_EXTENSIONS) + ")")
+        parts.append("所有文件 (*.*)")
+        return ";;".join(parts)
+
     def open_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开图像", "", IMAGE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "打开图像", "", self._image_filter())
         if path:
             self.load_image(path)
 
-    def load_image(self, path: str):
+    def _load_raw(self, path: str):
+        """用 rawpy(LibRaw) 解码 RAW，返回 uint8 RGB（失败返回 None）。"""
+        if rawpy is None:
+            QMessageBox.information(self, "无法打开 RAW",
+                                    "未安装 rawpy，请先执行：pip install rawpy")
+            return None
         try:
-            data = np.fromfile(path, dtype=np.uint8)
-            img = cv2.imdecode(data, cv2.IMREAD_COLOR)   # 兼容中文路径
-        except Exception:
-            img = None
-        if img is None:
-            QMessageBox.warning(self, "打开失败", f"无法解码图像：\n{path}")
-            return
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            with rawpy.imread(path) as raw:
+                rgb = raw.postprocess(
+                    use_camera_wb=True,                 # 相机白平衡
+                    output_color=rawpy.ColorSpace.sRGB,
+                    output_bps=8,
+                    no_auto_bright=True,                # 不做自动提亮，保留原始曝光
+                    user_flip=0,                        # 不做旋转（EXIF 方向见 README）
+                    demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+                )
+                meta = f"{getattr(raw.metadata, 'make', '') or ''} " \
+                       f"{getattr(raw.metadata, 'model', '') or ''}".strip()
+        except Exception as exc:
+            QMessageBox.warning(self, "RAW 解码失败", f"{path}\n\n{exc}")
+            return None
+        arr = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        if meta:
+            self.statusBar().showMessage(f"RAW：{meta}  {arr.shape[1]}×{arr.shape[0]}", 6000)
+        return arr
+
+    def load_image(self, path: str):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in RAW_EXTENSIONS:
+            rgb = self._load_raw(path)
+            if rgb is None:
+                return
+        else:
+            try:
+                data = np.fromfile(path, dtype=np.uint8)
+                img = cv2.imdecode(data, cv2.IMREAD_COLOR)   # 兼容中文路径
+            except Exception:
+                img = None
+            if img is None:
+                QMessageBox.warning(self, "打开失败", f"无法解码图像：\n{path}")
+                return
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.source = np.ascontiguousarray(rgb)
         self.preview_src = downscale_max_edge(self.source, PREVIEW_MAX_EDGE)
 
@@ -1148,6 +1217,10 @@ class MainWindow(QMainWindow):
         self._refresh_mask_overlays()
         self._update_status()
 
+    def _toggle_blackwhite(self, checked: bool):
+        self.params.blackwhite = 100.0 if checked else 0.0
+        self._on_params_changed(force_full=True)
+
     def reset_adjustments(self):
         self.params = Adjustments()
         self._mask_sel = None
@@ -1155,9 +1228,16 @@ class MainWindow(QMainWindow):
         self._overlay_cache.clear()
         self.preview.set_edit_mode("none")
         self.panel.set_params(self.params)
+        self._sync_toolbar_state()
         self._on_params_changed(force_full=True)
         self._refresh_mask_overlays()
         self.statusBar().showMessage("已重置全部调整", 1500)
+
+    def _sync_toolbar_state(self):
+        """让工具栏开关与当前参数保持一致。"""
+        self.act_bw.setChecked(self.params.blackwhite > 0)
+        self.act_compare.setChecked(self._comparing)
+        self.act_pick.setChecked(self.panel.picker._target is not None)
 
     def save_image(self):
         if self.source is None:
@@ -1309,8 +1389,9 @@ class MainWindow(QMainWindow):
     def _mask_geometry(m) -> dict:
         if m.kind == "linear":
             return {"x1": m.x1, "y1": m.y1, "x2": m.x2, "y2": m.y2}
-        if m.kind == "radial":
-            return {"cx": m.cx, "cy": m.cy, "radius": m.radius, "aspect": m.aspect}
+        elif m.kind == "radial":
+            return {"cx": m.cx, "cy": m.cy, "radius": m.radius,
+                    "aspect": m.aspect, "angle": m.angle}
         return {"size": m.size}
 
     def _exit_mask_edit(self):
@@ -1333,6 +1414,21 @@ class MainWindow(QMainWindow):
         if m is None or m.kind != "radial" or self._mask_edit is None:
             return
         m.cx, m.cy = nx, ny
+        self._after_mask_geometry_change(m)
+
+    def _on_radial_size(self, axis: int, radius: float, aspect: float):
+        m = self._current_mask()
+        if m is None or m.kind != "radial" or self._mask_edit is None:
+            return
+        m.radius = radius
+        m.aspect = aspect
+        self._after_mask_geometry_change(m)
+
+    def _on_radial_angle(self, deg: float):
+        m = self._current_mask()
+        if m is None or m.kind != "radial" or self._mask_edit is None:
+            return
+        m.angle = deg % 360.0
         self._after_mask_geometry_change(m)
 
     def _on_brush_point(self, nx: float, ny: float):
