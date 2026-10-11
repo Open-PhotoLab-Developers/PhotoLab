@@ -15,6 +15,13 @@ if RUN_UI:                                   # 必须在导入 Qt 之前设置
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("PHOTOLAB_SYNC", "1")
 
+# Windows 控制台默认 GBK，避免中文/符号输出报 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 import numpy as np
 
 import core
@@ -246,6 +253,102 @@ def test_masks():
         img, [m, m2]).max() <= 0.3 * 2 + 1e-6)
 
 
+def test_contrast_strength():
+    """对比度必须有可见效果（修复"滑块似乎不工作"）。"""
+    xs = np.array([0.1, 0.25, 0.5, 0.75, 0.9], np.float32).reshape(1, -1, 1).repeat(3, 2)
+    hi = core.apply_contrast(xs, 100)
+    lo = core.apply_contrast(xs, -100)
+    mid = core.apply_contrast(xs, 50)
+    check("对比度 +100 明显压暗暗部", float(hi[0, 0, 0]) < 0.02)
+    check("对比度 +100 明显提亮亮部", float(hi[0, 4, 0]) > 0.95)
+    check("对比度 +100 枢轴不变", abs(float(hi[0, 2, 0]) - 0.5) < 1e-6)
+    check("对比度 -100 向中间收缩", float(lo[0, 0, 0]) > 0.12 and float(lo[0, 4, 0]) < 0.88)
+    check("对比度 50 介于恒等与 100 之间",
+          float(mid[0, 0, 0]) > float(hi[0, 0, 0])
+          and float(mid[0, 4, 0]) < float(hi[0, 4, 0]))
+    check("对比度单调（暗->亮递增）",
+          bool(np.all(np.diff(hi[0, :, 0]) > 0)) and bool(np.all(np.diff(lo[0, :, 0]) > 0)))
+    # 真实感图像上的标准差提升
+    rng = np.random.default_rng(3)
+    rgb = (rng.random((300, 400, 3)) * 255).astype(np.uint8)
+    base = core.process(core.Adjustments(), rgb)
+    strong = core.process(core.Adjustments(contrast=100), rgb)
+    check("对比度 +100 显著提升对比（std +25% 以上）",
+          float(strong.std()) > float(base.std()) * 1.25)
+
+
+def test_dehaze_no_blackout():
+    """去朦胧不得把画面压黑（修复"调节导致画面变黑"）。"""
+    h, w = 600, 800
+    img = np.zeros((h, w, 3), np.float32)
+    yy, xx = np.mgrid[0:h, 0:w]
+    img[..., 0] = 0.55 + 0.1 * (xx / w)
+    img[..., 1] = 0.62 + 0.05 * (yy / h)
+    img[..., 2] = 0.75 - 0.08 * (yy / h)
+    img[400:, :] = (0.10, 0.18, 0.08)
+    rgb = (img * 255).astype(np.uint8)
+    base = core.process(core.Adjustments(), rgb)
+
+    for v in (25, 50, 75, 100):
+        out = core.process(core.Adjustments(dehaze=v), rgb)
+        black = 100.0 * float((out.mean(axis=-1) < 6).mean())
+        check(f"去朦胧 +{v} 不全黑（黑像素 {black:.1f}%）", black < 3.0)
+        check(f"去朦胧 +{v} 输出范围合法", int(out.min()) >= 0 and int(out.max()) <= 255)
+    check("去朦胧 +100 提升对比", float(core.process(core.Adjustments(dehaze=100), rgb).std())
+          > float(base.std()))
+    for v in (-50, -100):
+        out = core.process(core.Adjustments(dehaze=v), rgb)
+        check(f"去朦胧 {v}（加雾）降低对比", float(out.std()) < float(base.std()))
+
+
+def test_radial_shape():
+    """径向蒙版的形状（长宽比）与旋转。"""
+    shape = (400, 600)
+    m0 = core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.25, feather=0)
+    r0 = core.render_mask(m0, shape)
+    check("径向默认正圆（半径 0.25 短边=100px）",
+          float(r0[200, 300]) > 0.99 and float(r0[200, 100]) < 0.01)
+    # 拉长：aspect=2 时水平方向应覆盖更远
+    mx = core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.25, aspect=2.0, feather=0)
+    rx = core.render_mask(mx, shape)
+    check("长宽比 2 时水平覆盖更远", float(rx[200, 130]) > 0.5 and float(r0[200, 130]) < 0.01)
+    check("长宽比 2 时垂直覆盖不变", float(rx[260, 300]) < 0.01)
+    # 旋转 90° 后长轴变垂直
+    mrot = core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.25, aspect=2.0,
+                          feather=0, angle=90.0)
+    rr = core.render_mask(mrot, shape)
+    check("旋转 90° 后长轴变垂直", float(rr[280, 300]) > 0.5 and float(rx[280, 300]) < 0.01)
+    check("旋转 45° 覆盖对角", float(core.render_mask(
+        core.MaskState(kind="radial", cx=0.5, cy=0.5, radius=0.25, aspect=2.0,
+                       feather=0, angle=45.0), shape)[280, 380]) > 0.5)
+    check("旋转不影响中心", float(rr[200, 300]) > 0.99)
+    check("羽化 0 无 NaN", bool(np.all(np.isfinite(rx))))
+    check("旋转角度参与缓存键",
+          core.mask_cache_key(mx, shape) != core.mask_cache_key(mrot, shape))
+def test_blackwhite():
+    img = np.zeros((32, 32, 3), np.float32)
+    img[:16] = (0.8, 0.2, 0.2)
+    img[16:] = (0.2, 0.6, 0.9)
+    check("黑白 0 为恒等", np.array_equal(core.apply_blackwhite(img, 0), img))
+    gray = core.apply_blackwhite(img, 100)
+    check("黑白 100 三通道相等", float(np.abs(gray[..., 0] - gray[..., 1]).max()) < 1e-6
+          and float(np.abs(gray[..., 1] - gray[..., 2]).max()) < 1e-6)
+    lum = core.luminance(img)
+    check("黑白 100 等于亮度", float(np.abs(gray[..., 0] - lum).max()) < 1e-5)
+    half = core.apply_blackwhite(img, 50)
+    check("黑白 50 介于彩色与灰度之间",
+          float(np.abs(half[..., 0] - half[..., 1]).max()) > 1e-6
+          and float(np.abs(half[..., 0] - half[..., 1]).max())
+          < float(np.abs(img[..., 0] - img[..., 1]).max()))
+    # 流水线：黑白参数参与判定与渲染
+    p = core.Adjustments(blackwhite=100)
+    check("黑白参数使流水线生效", not p.is_default())
+    rgb = (core.to_srgb(img) * 255).astype(np.uint8)
+    out = core.process(p, rgb)
+    check("黑白流水线输出灰度",
+          float(np.abs(out[..., 0].astype(int) - out[..., 1]).max()) <= 1)
+
+
 def test_pipeline():
     rng = np.random.default_rng(3)
     rgb = (rng.random((200, 320, 3)) * 255).astype(np.uint8)
@@ -337,6 +440,8 @@ def run_ui_smoke() -> int:
     import cv2
     from PySide6.QtWidgets import QApplication
 
+    import core
+    import ui_window
     from ui_window import MainWindow
     from ui_widgets import apply_dark_theme
 
@@ -569,6 +674,55 @@ def run_ui_smoke() -> int:
         rad = window.params.masks[2]
         check("拖动径向中心", abs(rad.cx - 0.65) < 0.02 and abs(rad.cy - 0.35) < 0.02)
 
+        # 径向：拖动长轴手柄拉长椭圆（保持短轴）
+        info = window.preview.mask_handles_info()
+        hx = wxy(info["hx"][0], info["hx"][1])
+        before = (rad.radius, rad.aspect)
+        QTest.mouseMove(window.preview, hx)
+        QTest.mousePress(window.preview, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, hx)
+        mid = QPoint(int(hx.x() + 0.10 * info["hx"][0] * window.preview.width()),
+                     int(hx.y()))
+        QTest.mouseMove(window.preview, mid)
+        QTest.mouseRelease(window.preview, Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier, mid)
+        check("拖动长轴手柄拉长椭圆", rad.aspect > before[1] + 0.02)
+
+        # 成比例手感：同样再拖一小段，缩放比例应与拖拽距离成比例（缓慢、可预期）
+        info2 = window.preview.mask_handles_info()
+        hx2 = wxy(info2["hx"][0], info2["hx"][1])
+        radius_before = rad.radius
+        QTest.mouseMove(window.preview, hx2)
+        QTest.mousePress(window.preview, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, hx2)
+        step = QPoint(int(hx2.x() + 6), int(hx2.y()))
+        QTest.mouseMove(window.preview, step)
+        QTest.mouseRelease(window.preview, Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier, step)
+        # 6px 拖拽在 1:1 缩放下只应带来很小的半径变化
+        check("小幅度拖拽只产生小变化（灵敏度合理）",
+              abs(rad.radius - radius_before) < 0.08)
+
+        # 径向：拖动旋转手柄改变角度
+        info = window.preview.mask_handles_info()
+        rot = wxy(info["rot"][0], info["rot"][1])
+        QTest.mouseMove(window.preview, rot)
+        QTest.mousePress(window.preview, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, rot)
+        rot_to = wxy(0.2, 0.5)
+        QTest.mouseMove(window.preview, rot_to)
+        QTest.mouseRelease(window.preview, Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier, rot_to)
+        check("拖动旋转手柄改变角度", abs(rad.angle) > 1.0)
+
+        # 面板滑块：长宽比 / 旋转
+        window.panel.mask._on_aspect(220.0)
+        window.panel.mask._on_angle(45.0)
+        check("面板可设长宽比与旋转", abs(rad.aspect - 2.2) < 1e-6 and rad.angle == 45.0)
+        check("旋转后的蒙版渲染有效",
+              core.render_mask(rad, window.source.shape[:2]).shape
+              == window.source.shape[:2])
+
         # 编辑模式下左键不应平移画面
         pan_before = window.preview._pan
         QTest.mouseMove(window.preview, center)
@@ -584,6 +738,15 @@ def run_ui_smoke() -> int:
         for m in list(range(len(window.params.masks) - 1, -1, -1)):
             window.panel.mask.delete_mask(m)
         check("清理全部蒙版", not window.params.masks)
+
+        # ---- 黑白模式（顶栏开关）----
+        window.act_bw.trigger()                       # 打开
+        check("顶栏黑白开关生效", window.params.blackwhite == 100)
+        bw_frame = window._last_frame.copy()
+        check("黑白模式输出为灰度",
+              float(np.abs(bw_frame[..., 0].astype(int) - bw_frame[..., 1]).max()) <= 1)
+        window.act_bw.trigger()                       # 关闭
+        check("再次点击恢复彩色", window.params.blackwhite == 0)
 
         # ---- 对比原图 ----
         window._toggle_compare(True)
@@ -613,6 +776,50 @@ def run_ui_smoke() -> int:
         window.preview.zoom_fit()
         window.panel.set_histograms(None)
         check("直方图可更新", True)
+
+        # ---- RAW（rawpy 桩模块验证加载路径）----
+        import types
+        fake = types.ModuleType("rawpy")
+        captured = {}
+
+        class _FakeRaw:
+            def __init__(self, path):
+                self.metadata = types.SimpleNamespace(make="TestCam", model="X1")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def postprocess(self, **kwargs):
+                captured.update(kwargs)
+                arr = np.zeros((480, 640, 3), np.uint8)
+                arr[..., 0] = 200
+                arr[..., 1] = 90
+                arr[..., 2] = 80
+                return arr
+
+        fake.imread = lambda path: _FakeRaw(path)
+        fake.ColorSpace = types.SimpleNamespace(sRGB="sRGB")
+        fake.DemosaicAlgorithm = types.SimpleNamespace(AHD="AHD")
+        old_rawpy = ui_window.rawpy
+        ui_window.rawpy = fake
+        try:
+            raw_path = os.path.join(tmp, "sample.dng")
+            with open(raw_path, "wb") as fh:
+                fh.write(b"\x00\x01\x02")
+            window.load_image(raw_path)
+            check("RAW 路径被加载", window.source is not None
+                  and window.source.shape[:2] == (480, 640))
+            check("RAW 解码为 RGB", int(window.source[0, 0, 0]) == 200
+                  and int(window.source[0, 0, 2]) == 80)
+            check("RAW 后处理使用 sRGB 输出", captured.get("output_color") == "sRGB")
+            check("RAW 使用 AHD 去马赛克", captured.get("demosaic_algorithm") == "AHD")
+            check("RAW 使用相机白平衡", captured.get("use_camera_wb") is True)
+            check("文件过滤器包含 RAW", "RAW (" in window._image_filter())
+        finally:
+            ui_window.rawpy = old_rawpy
 
         # ---- 边界：小图 / 灰度图 ----
         small = (np.random.default_rng(1).random((60, 80, 3)) * 255).astype(np.uint8)
@@ -649,10 +856,14 @@ def main():
     print("== 曲线 ==");        test_curves()
     print("== 颜色分级 ==");    test_grading()
     print("== 取色器 ==");      test_picker()
+    print("== 黑白模式 ==");    test_blackwhite()
     print("== 流水线 ==");      test_pipeline()
     print("== 并行一致性 ==");  test_parallel_equals_serial()
     print("== 效果调节 ==");    test_effects()
+    print("== 对比度强度 ==");  test_contrast_strength()
+    print("== 去朦胧不发黑 =="); test_dehaze_no_blackout()
     print("== 蒙版 ==");        test_masks()
+    print("== 径向形状 ==");    test_radial_shape()
 
     if RUN_UI:
         print("== UI 冒烟 ==")
