@@ -306,6 +306,8 @@ class PreviewWidget(QWidget):
     # ---- 蒙版编辑 ----
     linearHandleMoved = Signal(int, float, float, float, float)  # 手柄, x1, y1, x2, y2
     radialCenterMoved = Signal(float, float)        # 归一化 x, y
+    radialSizeMoved = Signal(int, float, float)          # 轴 0=长轴 1=短轴, 半径, 长宽比
+    radialAngleMoved = Signal(float)                     # 角度（度）
     brushStrokePoint = Signal(float, float)         # 归一化 x, y
     brushStrokeFinished = Signal()
 
@@ -327,6 +329,8 @@ class PreviewWidget(QWidget):
         self._overlays: list = []       # 蒙版叠加 QImage 列表
         self._drag_handle: int | None = None   # 线性手柄索引 / None
         self._drag_line = False
+        self._radial_drag_start: dict | None = None   # 径向拖拽起始状态
+        self._hover_handle: str | None = None         # 悬停的手柄（高亮 + 光标）
         self._brush_cursor: QPointF | None = None
         self._brush_drawing = False
         self._panning = False
@@ -363,6 +367,8 @@ class PreviewWidget(QWidget):
         self._edit_info = info or {}
         self._drag_handle = None
         self._drag_line = False
+        self._radial_drag_start = None
+        self._hover_handle = None
         if mode != "none" and self._pick_mode:
             self._pick_mode = False
         self.update()
@@ -500,19 +506,85 @@ class PreviewWidget(QWidget):
             for pt in (a, b):
                 p.setBrush(QColor("#ffffff"))
                 p.drawEllipse(pt, 6.0, 6.0)
-        elif self._edit_mode == "radial":
-            info = self._edit_info
-            c = self.frame_point_to_widget(info.get("cx", 0.5), info.get("cy", 0.5))
-            radius_px = self._scale() * max(min(self._frame_size), 1) * info.get("radius", 0.3)
-            asp = max(float(info.get("aspect", 1.0)), 0.05)
-            rx, ry = radius_px * asp, radius_px / asp
-            p.drawEllipse(c, rx, ry)
+        if self._edit_mode == "radial":
+            c, rx, ry, ang = self._radial_geometry()
+            p.save()
+            p.translate(c)
+            p.rotate(math.degrees(ang))
+            p.drawEllipse(QPointF(0.0, 0.0), rx, ry)
+            p.restore()
+            # 中心点
             p.setBrush(QColor("#ffffff"))
             p.drawEllipse(c, 6.0, 6.0)
+            # 长轴手柄 / 短轴手柄 / 旋转手柄（悬停时放大高亮）
+            hx, hy = self._radial_handles()
+            for key, pt in (("size:0", hx), ("size:1", hy)):
+                hot = self._hover_handle == key or self._drag_handle == 10 + int(key[-1])
+                p.setBrush(QColor("#4c9be8") if not hot else QColor("#8fc4ff"))
+                p.drawEllipse(pt, 6.5 if hot else 5.5, 6.5 if hot else 5.5)
+            rot = QPointF(c.x() + 1.28 * rx * math.cos(ang),
+                          c.y() + 1.28 * rx * math.sin(ang))
+            hot_rot = self._hover_handle == "rotate" or self._drag_handle == 20
+            p.setPen(QPen(QColor("#e8a33d"), 1.5))
+            p.drawLine(hx, rot)
+            p.setBrush(QColor("#f0be62") if hot_rot else QColor("#e8a33d"))
+            p.drawEllipse(rot, 6.0 if hot_rot else 5.0, 6.0 if hot_rot else 5.0)
         elif self._edit_mode == "brush" and self._brush_cursor is not None:
             short = max(min(self._frame_size), 1)
             r = self._scale() * short * (self._edit_info.get("size", 12.0) / 100.0) * 0.5
             p.drawEllipse(self._brush_cursor, r, r)
+
+    def _radial_geometry(self):
+        """返回 (中心, rx, ry, 角度弧度)（控件像素单位）。"""
+        info = self._edit_info
+        fw, fh = self._frame_size
+        short = max(min(fw, fh), 1)
+        scale = self._scale()
+        R = max(float(info.get("radius", 0.3)), 0.01) * short
+        asp = max(float(info.get("aspect", 1.0)), 0.05)
+        ang = math.radians(float(info.get("angle", 0.0)))
+        c = self.frame_point_to_widget(info.get("cx", 0.5), info.get("cy", 0.5))
+        return c, R * asp * scale, (R / asp) * scale, ang
+
+    def _radial_handles(self):
+        """长轴手柄与短轴手柄的控件坐标。"""
+        c, rx, ry, ang = self._radial_geometry()
+        hx = QPointF(c.x() + rx * math.cos(ang), c.y() + rx * math.sin(ang))
+        hy = QPointF(c.x() - ry * math.sin(ang), c.y() + ry * math.cos(ang))
+        return hx, hy
+
+    def mask_handles_info(self) -> dict:
+        """当前径向蒙版各手柄的归一化坐标（供测试与调试）。"""
+        if self._edit_mode != "radial":
+            return {}
+        c, rx, ry, ang = self._radial_geometry()
+        s = max(self._scale(), 1e-6)
+        fw, fh = self._frame_size
+        off = self._offset()
+
+        def to_norm(x, y):
+            return ((x - off.x()) / s / max(fw, 1), (y - off.y()) / s / max(fh, 1))
+
+        hx = (c.x() + rx * math.cos(ang), c.y() + rx * math.sin(ang))
+        hy = (c.x() - ry * math.sin(ang), c.y() + ry * math.cos(ang))
+        rot = (c.x() + 1.28 * rx * math.cos(ang), c.y() + 1.28 * rx * math.sin(ang))
+        return {"center": to_norm(c.x(), c.y()), "hx": to_norm(*hx),
+                "hy": to_norm(*hy), "rot": to_norm(*rot)}
+
+    def _radial_hit(self, pos: QPointF) -> str | None:
+        c, rx, ry, ang = self._radial_geometry()
+        hx, hy = self._radial_handles()
+        if (QPointF(hx) - pos).manhattanLength() <= 12.0:
+            return "size:0"
+        if (QPointF(hy) - pos).manhattanLength() <= 12.0:
+            return "size:1"
+        rot = QPointF(c.x() + 1.28 * rx * math.cos(ang),
+                      c.y() + 1.28 * rx * math.sin(ang))
+        if (QPointF(rot) - pos).manhattanLength() <= 12.0:
+            return "rotate"
+        if (QPointF(c) - pos).manhattanLength() <= 14.0:
+            return "center"
+        return None
 
     # ------------------------------------------------------------ 事件
     def wheelEvent(self, event):
@@ -564,10 +636,14 @@ class PreviewWidget(QWidget):
                 self._start_pan(pos)
             return
         if self._edit_mode == "radial":
-            c = self.frame_point_to_widget(self._edit_info.get("cx", 0.5),
-                                           self._edit_info.get("cy", 0.5))
-            if (QPointF(c) - pos).manhattanLength() <= 14.0:
+            hit = self._radial_hit(pos)
+            if hit == "center":
                 self._drag_handle = 0
+            elif hit in ("size:0", "size:1"):
+                self._drag_handle = 10 + int(hit.split(":")[1])
+                self._begin_radial_size_drag(pos)
+            elif hit == "rotate":
+                self._drag_handle = 20
             else:
                 self._start_pan(pos)
             return
@@ -578,6 +654,99 @@ class PreviewWidget(QWidget):
                 self.brushStrokePoint.emit(*self.widget_to_norm(pos.x(), pos.y()))
             return
         self._start_pan(pos)
+
+    def _begin_radial_size_drag(self, pos: QPointF):
+        """记录大小手柄拖拽的起始比例，之后按比例缩放（手感接近 LR：拖慢、可预期）。"""
+        info = self._edit_info
+        fw, fh = self._frame_size
+        short = max(min(fw, fh), 1)
+        ang = math.radians(float(info.get("angle", 0.0)))
+        cx, cy = info.get("cx", 0.5), info.get("cy", 0.5)
+        dx = ((pos.x() - self._offset().x()) / max(self._scale(), 1e-6)) / max(fw, 1) - cx
+        dy = ((pos.y() - self._offset().y()) / max(self._scale(), 1e-6)) / max(fh, 1) - cy
+        local_x = (dx * fw * math.cos(ang) + dy * fh * math.sin(ang)) / short
+        local_y = (-dx * fw * math.sin(ang) + dy * fh * math.cos(ang)) / short
+        asp = max(float(info.get("aspect", 1.0)), 0.05)
+        radius = max(float(info.get("radius", 0.3)), 0.01)
+        self._radial_drag_start = {
+            "radius": radius, "aspect": asp,
+            "rx": radius * asp, "ry": radius / asp,
+            "lx": abs(local_x), "ly": abs(local_y),
+        }
+
+    def _radial_drag(self, nx: float, ny: float):
+        """径向蒙版拖拽：中心 / 长轴 / 短轴 / 旋转。"""
+        info = self._edit_info
+        handle = self._drag_handle
+        if handle == 0:
+            info["cx"], info["cy"] = nx, ny
+            self.radialCenterMoved.emit(nx, ny)
+            return
+
+        fw, fh = self._frame_size
+        short = max(min(fw, fh), 1)
+        ang = math.radians(float(info.get("angle", 0.0)))
+        cx, cy = info.get("cx", 0.5), info.get("cy", 0.5)
+        dx = (nx - cx) * fw
+        dy = (ny - cy) * fh
+        dist = math.hypot(dx, dy)
+
+        if handle == 20:                                  # 旋转手柄
+            deg = math.degrees(math.atan2(dy, dx)) % 360.0
+            info["angle"] = deg
+            self.radialAngleMoved.emit(deg)
+            return
+
+        # 局部坐标（沿椭圆轴分解），换算成“短边归一化”半径
+        local_x = (dx * math.cos(ang) + dy * math.sin(ang)) / short
+        local_y = (-dx * math.sin(ang) + dy * math.cos(ang)) / short
+
+        start = self._radial_drag_start
+        if handle == 10:                                  # 长轴手柄
+            if start and start["lx"] > 1e-3:
+                # 成比例缩放：拖拽距离 / 起始距离 = 缩放倍数（手感缓慢、可预期）
+                scale = abs(local_x) / start["lx"]
+                rx_new = float(np.clip(start["rx"] * scale, 0.02, 2.0))
+                ry = start["ry"]
+            else:
+                rx_new, ry = max(abs(local_x), 0.02), start["ry"] if start else 0.3
+            asp_new = float(np.clip(rx_new / max(ry, 1e-3), 0.2, 5.0))
+            info["aspect"] = asp_new
+            info["radius"] = float(np.sqrt(max(rx_new * ry, 1e-6)))
+        elif handle == 11:                                # 短轴手柄
+            if start and start["ly"] > 1e-3:
+                scale = abs(local_y) / start["ly"]
+                ry_new = float(np.clip(start["ry"] * scale, 0.02, 2.0))
+                rx = start["rx"]
+            else:
+                ry_new, rx = max(abs(local_y), 0.02), start["rx"] if start else 0.3
+            asp_new = float(np.clip(max(rx, 1e-3) / ry_new, 0.2, 5.0))
+            info["aspect"] = asp_new
+            info["radius"] = float(np.sqrt(max(rx * ry_new, 1e-6)))
+        else:
+            return
+        self.radialSizeMoved.emit(handle - 10, info["radius"], info["aspect"])
+        self._edit_info = info
+
+    def _update_hover(self, pos: QPointF):
+        """悬停检测：命中手柄时高亮并切换光标（像 LR 那样先悬停再拖）。"""
+        if self._edit_mode == "radial":
+            hit = self._radial_hit(pos)
+        elif self._edit_mode == "linear":
+            hit = self._linear_hit(pos)
+        else:
+            hit = None
+        if hit != self._hover_handle:
+            self._hover_handle = hit
+            self.update()
+        if hit in ("size:0", "size:1"):
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        elif hit == "rotate":
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif hit in ("center", "handle:0", "handle:1", "line"):
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _start_pan(self, pos: QPointF):
         self._panning = True
@@ -592,6 +761,8 @@ class PreviewWidget(QWidget):
                 if self._brush_drawing:
                     self.brushStrokePoint.emit(*self.widget_to_norm(pos.x(), pos.y()))
                 self.update()
+        elif self._edit_mode != "none" and not self._placeholder and self._drag_handle is None:
+            self._update_hover(pos)
         if self._drag_handle is not None:
             nx, ny = self.widget_to_norm(pos.x(), pos.y())
             if self._edit_mode == "linear":
@@ -603,7 +774,7 @@ class PreviewWidget(QWidget):
                 self.linearHandleMoved.emit(self._drag_handle, info["x1"], info["y1"],
                                             info["x2"], info["y2"])
             elif self._edit_mode == "radial":
-                self.radialCenterMoved.emit(nx, ny)
+                self._radial_drag(nx, ny)
             return
         if self._drag_line:
             delta = pos - self._pan_last
@@ -632,6 +803,7 @@ class PreviewWidget(QWidget):
                 self.brushStrokeFinished.emit()
             self._drag_handle = None
             self._drag_line = False
+            self._radial_drag_start = None
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
             self._panning = False
             self.setCursor(Qt.CursorShape.CrossCursor if self._pick_mode
@@ -640,6 +812,11 @@ class PreviewWidget(QWidget):
     def mouseDoubleClickEvent(self, event):
         if not self._placeholder:
             self.zoom_fit()
+
+    def leaveEvent(self, event):
+        if self._hover_handle is not None:
+            self._hover_handle = None
+            self.update()
 
 
 # ======================================================================
