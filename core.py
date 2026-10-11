@@ -166,11 +166,12 @@ class MaskState:
     x2: float = 0.7
     y2: float = 0.5
 
-    # 径向渐变（椭圆）：中心 / 半径 / 长宽比
+    # 径向渐变（椭圆）：中心 / 半径 / 长宽比 / 旋转角
     cx: float = 0.5
     cy: float = 0.5
     radius: float = 0.30
     aspect: float = 1.0
+    angle: float = 0.0            # 椭圆长轴角度（度）
 
     # 画笔：笔刷大小 + 笔画（每段笔画是 [(x, y), ...] 归一化点序列）
     size: float = 12.0                   # 1..100
@@ -201,6 +202,7 @@ class Adjustments:
     # ---- 颜色基础 ----
     saturation: float = 0.0    # -100..100
     vibrance: float = 0.0      # -100..100
+    blackwhite: float = 0.0    # 0..100 黑白混合（100 = 完全灰度）
 
     # ---- 效果 ----
     clarity: float = 0.0       # -100..100 清晰度（中频局部对比）
@@ -232,7 +234,7 @@ class Adjustments:
         """全部为默认值时可直接跳过处理（快速预览 / 保存原图）。"""
         for name in ("temperature", "tint", "exposure", "contrast", "highlights",
                      "shadows", "whites", "blacks", "saturation", "vibrance",
-                     "clarity", "sharpen", "dehaze"):
+                     "clarity", "sharpen", "dehaze", "blackwhite"):
             if getattr(self, name) != 0.0:
                 return False
         for pts in self.curves.values():
@@ -291,20 +293,40 @@ def apply_exposure(img: np.ndarray, ev: float) -> np.ndarray:
 
 
 def apply_contrast(img: np.ndarray, amount: float) -> np.ndarray:
-    """对比度：绕 0.5 的 S 曲线（smoothstep 混合），保证 0/1 端点不动。"""
+    """对比度：绕 0.5 的 S 曲线，保证 0/1 端点不动。
+
+    正值用 smoothstep(smoothstep(v))（枢轴斜率 2.25、端点趋平，接近 LR 的 +100 手感）；
+    负值向 smoothstep(v) 混合（枢轴斜率降到 0.5，画面发灰）。
+    """
     if amount == 0:
         return img
     a = np.float32(np.clip(amount / 100.0, -1.0, 1.0))
     out = np.array(img, dtype=np.float32, copy=True)
-    t2 = out * out
+    v = out
+
+    # smoothstep(v) = 3v² - 2v³
+    t2 = v * v
     t2 *= np.float32(2.0)
-    t2 *= out                      # t2 = 2v³
-    t = out * out
-    t *= np.float32(3.0)           # t = 3v²
-    t -= t2                        # t = 3v² - 2v³ = smoothstep(v)
-    t *= a
-    out *= np.float32(1.0) - a
-    out += t
+    t2 *= v                          # t2 = 2v³
+    s = v * v
+    s *= np.float32(3.0)             # s = 3v²
+    s -= t2                          # s = smoothstep(v)
+
+    if a > 0:
+        # smoothstep(smoothstep(v))：枢轴斜率 2.25、端点趋平，接近 LR 的 +100 手感
+        u2 = s * s
+        u2 *= np.float32(2.0)
+        u2 *= s                      # 2s³
+        s2 = s * s
+        s2 *= np.float32(3.0)        # 3s²
+        s2 -= u2                     # smoothstep(smoothstep(v))
+        out = v * (np.float32(1.0) - a) + s2 * a
+    else:
+        # v + c·v(1-v)(v-0.5)，c = 2a ∈ [-2, 0]：枢轴斜率降到 0.5，端点斜率 ≤ 2，保持单调
+        c = np.float32(2.0) * a
+        t = v * (np.float32(1.0) - v)
+        t *= (v - np.float32(0.5))
+        out = v + c * t
     return out
 
 
@@ -388,6 +410,15 @@ def apply_vibrance(img: np.ndarray, amount: float) -> np.ndarray:
     out *= w[..., None]
     out += lum[..., None]
     return out
+
+
+def apply_blackwhite(img: np.ndarray, amount: float) -> np.ndarray:
+    """黑白模式：按 Rec.709 亮度混合到灰度。amount 0..100（强度）。"""
+    if amount == 0:
+        return img
+    k = np.float32(np.clip(amount / 100.0, 0.0, 1.0))
+    lum = luminance(img)[..., None]
+    return img * (np.float32(1.0) - k) + lum * k
 
 
 def apply_basic(img: np.ndarray, params) -> np.ndarray:
@@ -799,6 +830,9 @@ def apply_dehaze(img: np.ndarray, amount: float, A: float | None = None,
     amount > 0 去雾（增强对比，尤其远处）；amount < 0 反向加雾（降低对比、抬黑位）。
     A 为整幅图统一估计的大气光，sigma 为统一的暗通道平滑半径，
     二者都由 GlobalStats 提供，保证分块结果逐位一致。
+
+    雾模型 I = J·t + A(1-t)  =>  J = (I - A)/t + A，再按 |amount| 强度与原图混合，
+    避免小档位也出现剧烈跳变。
     """
     if amount == 0:
         return img
@@ -818,11 +852,17 @@ def apply_dehaze(img: np.ndarray, amount: float, A: float | None = None,
     dark = np.min(img, axis=-1)                     # (H,W)
     dark = cv2.GaussianBlur(dark, (0, 0), sigmaX=sigma)
 
-    omega = 0.9
+    omega = 0.85
     t = np.float32(1.0) - np.float32(omega * a) * (dark / np.float32(A))
-    t = np.clip(t, 0.30, 3.0).astype(np.float32)[..., None]      # (H,W,1)
-    # J = (I - A)/t + A：t<1 提亮去雾，t>1 压向 A（雾化）
-    out = (img - np.float32(A)) / t + np.float32(A) * (np.float32(1.0) - np.float32(1.0) / t)
+    t = np.clip(t, 0.15, 4.0).astype(np.float32)[..., None]      # (H,W,1)
+
+    # 标准雾模型求解，并裁剪到 [0,1] 防止暗部被过度压黑
+    J = (img - np.float32(A)) / t + np.float32(A)
+    np.clip(J, 0.0, 1.0, out=J)
+
+    # 强度混合：amount=±100 为完全生效，中间档位平滑过渡
+    k = np.float32(abs(a))
+    out = img * (np.float32(1.0) - k) + J * k
     return out.astype(np.float32)
 
 
@@ -919,19 +959,30 @@ def _linear_mask(m: "MaskState", shape) -> np.ndarray:
 
 
 def _radial_mask(m: "MaskState", shape) -> np.ndarray:
-    """径向渐变蒙版：椭圆内为 1，边缘按羽化过渡到 0。"""
+    """径向渐变蒙版：椭圆内为 1，边缘按羽化过渡到 0。
+
+    rx = radius*aspect（长轴）、ry = radius/aspect（短轴），angle 为长轴方向（度）。
+    """
     h, w = shape
     xs, ys = _axis_coords(shape)
     short = max(min(w, h), 1)
     R = max(m.radius, 0.01) * short
     asp = max(float(m.aspect), 0.05)
-    dx = ((xs - np.float32(m.cx)) * np.float32(w / (R * asp)))
-    dy = ((ys - np.float32(m.cy)) * np.float32(h / (R / asp)))
-    d2 = dx * dx                                   # (W,)
-    d2y = dy * dy                                  # (H,)
-    dist = np.sqrt(d2[None, :] + d2y[:, None]).astype(np.float32)   # 1 = 椭圆边界
+    px = (xs - np.float32(m.cx)) * np.float32(w)      # (W,)
+    py = (ys - np.float32(m.cy)) * np.float32(h)      # (H,)
+    ang = np.deg2rad(float(m.angle))
+    ca, sa = np.float32(np.cos(ang)), np.float32(np.sin(ang))
+    # 旋转 -ang，把椭圆轴对齐到坐标轴
+    xr = px * ca + py[:, None] * sa                    # (H,W) 广播
+    yr = -px * sa + py[:, None] * ca
+    rx = R * asp
+    ry = R / asp
+    d = np.sqrt((xr / np.float32(rx)) ** 2 + (yr / np.float32(ry)) ** 2)
+    d = d.astype(np.float32)                            # 1 = 椭圆边界
     f = float(np.clip(m.feather / 100.0, 0.0, 1.0))
-    return np.float32(1.0) - smoothstep(np.float32(1.0 - f), np.float32(1.0), dist)
+    if f <= 0.0:
+        return (d <= np.float32(1.0)).astype(np.float32)     # 硬边，避免 smoothstep 除零
+    return np.float32(1.0) - smoothstep(np.float32(1.0 - f), np.float32(1.0), d)
 
 
 def _brush_mask(m: "MaskState", shape) -> np.ndarray:
@@ -1043,7 +1094,8 @@ def mask_cache_key(m: "MaskState", shape) -> tuple:
     if m.kind == "linear":
         return base + (round(m.x1, 5), round(m.y1, 5), round(m.x2, 5), round(m.y2, 5))
     if m.kind == "radial":
-        return base + (round(m.cx, 5), round(m.cy, 5), round(m.radius, 5), round(m.aspect, 5))
+        return base + (round(m.cx, 5), round(m.cy, 5), round(m.radius, 5),
+                       round(m.aspect, 5), round(m.angle, 4))
     strokes = tuple(tuple((round(x, 5), round(y, 5)) for x, y in s) for s in m.strokes)
     return base + (round(m.size, 4), strokes)
 
@@ -1161,6 +1213,8 @@ def _process_rows(params, lin: np.ndarray, y0: int, y1: int, pad: int,
     out = apply_masked_adjustments(out, params.masks, renderer=renderer,
                                    y0=a, y1=b, low=low, stats=stats)   # 5. 蒙版局部调整
     out = apply_pickers(out, params.pickers)                          # 6. 取色器
+    if params.blackwhite:                                            # 7. 黑白
+        out = apply_blackwhite(out, params.blackwhite)
     np.clip(out, 0.0, 1.0, out=out)
     result = linear_to_rgb8(out)
     return result[y0 - a:result.shape[0] - (b - y1)]
